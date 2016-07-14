@@ -1,0 +1,15 @@
+name: vim
+version: 1.0
+summary: Vim in a box
+description: A simple text editor
+confinement: strict
+
+apps:
+  text-editor:
+    command: /usr/bin/vim
+
+parts:
+  application:
+    plugin: nil
+    stage-packages:
+      - vim

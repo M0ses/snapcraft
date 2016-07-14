@@ -238,3 +238,4 @@ from snapcraft import common                        # noqa
 from snapcraft import plugins                       # noqa
 from snapcraft import sources                       # noqa
 from snapcraft.internal import repo                 # noqa
+from snapcraft.internal import zypper               # noqa
