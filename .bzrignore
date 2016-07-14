@@ -3,6 +3,10 @@ demos/*/parts/
 demos/*/prime/
 demos/*/stage/
 demos/**/*.snap
+demos/suse/*/parts/
+demos/suse/*/prime/
+demos/suse/*/stage/
+demos/suse/**/*.snap
 tests/unit/parts/
 tests/unit/snap/
 tests/unit/stage/

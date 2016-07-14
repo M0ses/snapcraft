@@ -14,25 +14,22 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import fileinput
 import glob
 import itertools
 import logging
 import os
 import platform
 import re
+import string
 import shutil
 import stat
-import string
 import subprocess
 import urllib
 import urllib.request
 
-import apt
-from xml.etree import ElementTree
-
 import snapcraft
 from snapcraft.internal import common
+from snapcraft.internal import zypper
 
 
 _BIN_PATHS = (
@@ -44,19 +41,12 @@ _BIN_PATHS = (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SOURCES = \
-    '''deb http://${prefix}.ubuntu.com/${suffix}/ ${release} main restricted
-deb http://${prefix}.ubuntu.com/${suffix}/ ${release}-updates main restricted
-deb http://${prefix}.ubuntu.com/${suffix}/ ${release} universe
-deb http://${prefix}.ubuntu.com/${suffix}/ ${release}-updates universe
-deb http://${prefix}.ubuntu.com/${suffix}/ ${release} multiverse
-deb http://${prefix}.ubuntu.com/${suffix}/ ${release}-updates multiverse
-deb http://${security}.ubuntu.com/${suffix} ${release}-security main restricted
-deb http://${security}.ubuntu.com/${suffix} ${release}-security universe
-deb http://${security}.ubuntu.com/${suffix} ${release}-security multiverse
-'''
-_GEOIP_SERVER = "http://geoip.ubuntu.com/lookup"
-
+_DEFAULT_SOURCES = (
+    ('http://download.opensuse.org/${release}/repo/debug','repo-debug','yast2'),
+    ('http://download.opensuse.org/${release}/repo/non-oss','repo-non-oss','yast2'),
+    ('http://download.opensuse.org/${release}/repo/oss','repo-oss','yast2'),
+    ('http://download.opensuse.org/update/${release}/','repo-update','rpm-md')
+)
 
 def is_package_installed(package):
     """Return True if a package is installed on the system.
@@ -64,22 +54,23 @@ def is_package_installed(package):
     :param str package: the deb package to query for.
     :returns: True if the package is installed, False if not.
     """
-    with apt.Cache() as apt_cache:
-        return apt_cache[package].installed
+    with zypper.Cache() as zypper_cache:
+        return zypper_cache[package].installed
 
 
 def install_build_packages(packages):
     unique_packages = set(packages)
     new_packages = []
-    with apt.Cache() as apt_cache:
+   
+    with zypper.Cache() as zypper_cache:
         for pkg in unique_packages:
             try:
-                if not apt_cache[pkg].installed:
+                if not zypper_cache[pkg].installed:
                     new_packages.append(pkg)
             except KeyError as e:
                 raise EnvironmentError(
-                    "Could not find a required package in "
-                    "'build-packages': {}".format(str(e)))
+                        "Could not find a required package in "
+                        "'build-packages': {}".format(str(e)))
     if new_packages:
         logger.info(
             'Installing build dependencies: %s', ' '.join(new_packages))
@@ -88,17 +79,16 @@ def install_build_packages(packages):
             'DEBIAN_FRONTEND': 'noninteractive',
             'DEBCONF_NONINTERACTIVE_SEEN': 'true',
         })
-        subprocess.check_call(['sudo', 'apt-get', '-o',
-                               'Dpkg::Progress-Fancy=1',
-                               '--no-install-recommends', '-y',
-                               'install'] + new_packages, env=env)
+        subprocess.check_call(['sudo', 'zypper','-n','install',
+                               '--no-recommends',
+                               ] + new_packages, env=env)
 
 
 class PackageNotFoundError(Exception):
 
     @property
     def message(self):
-        return 'The Ubuntu package "{}" was not found'.format(
+        return 'The package "{}" was not found'.format(
             self.package_name)
 
     def __init__(self, package_name):
@@ -115,7 +105,7 @@ class UnpackError(Exception):
         self.package_name = package_name
 
 
-class Ubuntu:
+class Repo:
 
     def __init__(self, rootdir, recommends=False,
                  sources=None, project_options=None):
@@ -125,10 +115,17 @@ class Ubuntu:
 
         if not project_options:
             project_options = snapcraft.ProjectOptions()
-        self.apt_cache, self.apt_progress = _setup_apt_cache(
+        self.repo_cache, self.repo_progress = _setup_zypper(
             rootdir, sources, project_options)
 
     def get(self, package_names):
+        logger.debug("Getting packages: %s" % ",".join(package_names) )
+        self.downloaddir = self.repo_cache.rootdir
+        logger.debug("changed downloaddir to %s" % self.downloaddir)
+        self.repo_cache.download_packages(package_names)
+
+        # TODO: find a way how to exclude base packages from snap
+        '''
         # Create the 'partial' subdir too (LP: #1578007).
         os.makedirs(os.path.join(self.downloaddir, 'partial'), exist_ok=True)
 
@@ -136,7 +133,7 @@ class Ubuntu:
 
         for name in package_names:
             try:
-                self.apt_cache[name].mark_install()
+                self.repo_cache[name].mark_install()
             except KeyError:
                 raise PackageNotFoundError(name)
 
@@ -144,11 +141,7 @@ class Ubuntu:
         skipped_blacklisted = []
 
         # unmark some base packages here
-        # note that this will break the consistency check inside apt_cache
-        # (self.apt_cache.broken_count will be > 0)
-        # but that is ok as it was consistent before we excluded
-        # these base package
-        for pkg in self.apt_cache:
+        for pkg in self.repo_cache:
             # those should be already on each system, it also prevents
             # diving into downloading libc6
             if (pkg.candidate.priority in 'essential' and
@@ -168,20 +161,31 @@ class Ubuntu:
             print('Skipping blacklisted from manifest packages:',
                   skipped_blacklisted)
 
-        # download the remaining ones with proper progress
-        apt.apt_pkg.config.set("Dir::Cache::Archives", self.downloaddir)
-        self.apt_cache.fetch_archives(progress=self.apt_progress)
+        '''
 
     def unpack(self, rootdir):
-        pkgs_abs_path = glob.glob(os.path.join(self.downloaddir, '*.deb'))
-        for pkg in pkgs_abs_path:
+        logger.debug("Unpacking in rootdir: %s" % rootdir)
+        logger.debug("Downloaddir: %s" % self.downloaddir)
+        search_glob = os.path.join(self.downloaddir,'var/cache/zypp/packages', '**', '*.rpm')
+        logger.debug("Searching packages in %s" % search_glob)
+        odir = os.getcwd()
+        logger.debug("changing directory to '%s'" % rootdir)
+        os.makedirs(rootdir, exist_ok=True) 
+        os.chdir(rootdir)
+        for pkg in glob.glob(search_glob,recursive=True):
+            logger.debug("Extrating file '%s'" % pkg)
             # TODO needs elegance and error control
-            try:
-                subprocess.check_call(['dpkg-deb', '--extract', pkg, rootdir])
-            except subprocess.CalledProcessError:
-                raise UnpackError(pkg)
+            #try:
+            rpm2cpio  = subprocess.Popen(['rpm2cpio',pkg],stdout=subprocess.PIPE)
+            cpio2disk = subprocess.Popen(['cpio','-idmv'],stdin=rpm2cpio.stdout, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            rpm2cpio.stdout.close()
 
-        _fix_artifacts(rootdir)
+            #except subprocess.CalledProcessError as e:
+            #    print(e.stdout)
+            #    os.chdir(odir)
+            #    raise UnpackError(pkg)
+        os.chdir(odir)
+        _fix_symlinks(rootdir)
         _fix_xml_tools(rootdir)
         _fix_shebangs(rootdir)
 
@@ -192,121 +196,94 @@ class Ubuntu:
                                                'manifest.txt'))) as f:
             for line in f:
                 pkg = line.strip()
-                if pkg in self.apt_cache:
+                if pkg in self.repo_cache:
                     manifest_dep_names.add(pkg)
 
         return manifest_dep_names
 
 
 def _get_local_sources_list():
-    sources_list = glob.glob('/etc/apt/sources.list.d/*.list')
-    sources_list.append('/etc/apt/sources.list')
 
-    sources = ''
-    for source in sources_list:
-        with open(source) as f:
-            sources += f.read()
-
+    with zypper.Cache(rootdir="/") as zypp:
+        sources = []
+        repolist = zypp.repo_list()
+        for rep in repolist:
+            logger.debug("URL(%s): %s " % (rep['enabled'],rep['url']))
+            if int(rep['enabled']) == 1:
+                logger.debug(" - Adding")
+                sources.append(
+		    [
+                        rep['url'],
+			rep['alias'],
+			rep['type']
+		    ]
+                )
     return sources
 
 
-def _get_geoip_country_code_prefix():
-    try:
-        with urllib.request.urlopen(_GEOIP_SERVER) as f:
-            xml_data = f.read()
-        et = ElementTree.fromstring(xml_data)
-        cc = et.find("CountryCode")
-        if cc is None:
-            return ""
-        return cc.text.lower()
-    except (ElementTree.ParseError, urllib.error.URLError):
-        pass
-    return ''
-
-
-def _format_sources_list(sources, project_options, release='xenial'):
+def _format_sources_list(sources, project_options, release='tumbleweed'):
     if not sources:
         sources = _DEFAULT_SOURCES
 
-    if project_options.deb_arch in ('amd64', 'i386'):
-        if project_options.use_geoip:
-            geoip_prefix = _get_geoip_country_code_prefix()
-            prefix = '{}.archive'.format(geoip_prefix)
-        else:
-            prefix = 'archive'
-        suffix = 'ubuntu'
-        security = 'security'
-    else:
-        prefix = 'ports'
-        suffix = 'ubuntu-ports'
-        security = 'ports'
+    result = ()
 
-    return string.Template(sources).substitute({
-        'prefix': prefix,
-        'release': release,
-        'suffix': suffix,
-        'security': security,
-    })
+    for src in sources:
+        result.append(
+            string.Template(src[0]).substitute({
+                'release': release
+            }),
+            src[1],
+            src[2]
+        )
+
+    return result
 
 
-def _setup_apt_cache(rootdir, sources, project_options):
-    os.makedirs(os.path.join(rootdir, 'etc', 'apt'), exist_ok=True)
-    srcfile = os.path.join(rootdir, 'etc', 'apt', 'sources.list')
+def _setup_zypper(rootdir, sources, project_options):
 
-    if project_options.use_geoip or sources:
-        release = platform.linux_distribution()[2]
+    progress = None
+
+    zypp_dir = os.path.join(rootdir, 'etc', 'zypp')
+    logger.debug("Creating zypp_dir: %s" % zypp_dir)
+    os.makedirs(os.path.join(rootdir, 'etc', 'zypp'), exist_ok=True)
+
+    if sources:
+        release = _get_suse_url()
+        logger.debug("Formatting source list (release: %s)" % release)
         sources = _format_sources_list(
             sources, project_options, release)
     else:
+        logger.debug("Using local source list")
         sources = _get_local_sources_list()
 
-    with open(srcfile, 'w') as f:
-        f.write(sources)
+    zypp = zypper.Cache(rootdir=rootdir)
+    for src in sources:
+        logger.debug("Adding repo '%s' with url: %s" % (src[1],src[0]))
+        zypp.add_repo(url=src[0],alias=src[1],type=src[2])
+    
+    zypp.refresh()
 
-    # Do not install recommends
-    apt.apt_pkg.config.set('Apt::Install-Recommends', 'False')
-
-    # Make sure we always use the system GPG configuration, even with
-    # apt.Cache(rootdir).
-    for key in 'Dir::Etc::Trusted', 'Dir::Etc::TrustedParts':
-        apt.apt_pkg.config.set(key, apt.apt_pkg.config.find_file(key))
-
-    progress = apt.progress.text.AcquireProgress()
-    if not os.isatty(1):
-        # Make output more suitable for logging.
-        progress.pulse = lambda owner: True
-        progress._width = 0
-
-    apt_cache = apt.Cache(rootdir=rootdir, memonly=True)
-    apt.apt_pkg.config.clear("APT::Update::Post-Invoke-Success")
-    apt_cache.update(fetch_progress=progress, sources_list=srcfile)
-    apt_cache.open()
-
-    return apt_cache, progress
+    return zypp, progress
 
 
-def fix_pkg_config(root, pkg_config_file, prefix_trim=None):
-    """Opens a pkg_config_file and prefixes the prefix with root."""
-    pattern_trim = None
-    if prefix_trim:
-        pattern_trim = re.compile(
-            '^prefix={}(?P<prefix>.*)'.format(prefix_trim))
-    pattern = re.compile('^prefix=(?P<prefix>.*)')
+def _get_suse_url():
+    os_str  = platform.linux_distribution()[0]
+    version = platform.linux_distribution()[1]
 
-    with fileinput.input(pkg_config_file, inplace=True) as input_file:
-        for line in input_file:
-            match = pattern.search(line)
-            if prefix_trim:
-                match_trim = pattern_trim.search(line)
-            if prefix_trim and match_trim:
-                print('prefix={}{}'.format(root, match_trim.group('prefix')))
-            elif match:
-                print('prefix={}{}'.format(root, match.group('prefix')))
-            else:
-                print(line, end='')
+    if os_str == "openSUSE ":
+        if float(version) > 20160000:
+            return "tumbleweed"
+        if float(version) > 42:
+            return "distribution/leap/%s" % version
 
+    if os_str == 'SUSE Linux Enterprise Server ':
+        logger.error("Support for SUSE Linux Enterprise Server not implemented yes")
+        # FIXME: implement for SLES
+        pass
 
-def _fix_artifacts(debdir):
+    raise NotImplementedError
+
+def _fix_symlinks(debdir):
     '''
     Sometimes debs will contain absolute symlinks (e.g. if the relative
     path would go all the way to root, they just do absolute).  We can't
@@ -321,12 +298,17 @@ def _fix_artifacts(debdir):
         for entry in itertools.chain(files, dirs):
             path = os.path.join(root, entry)
             if os.path.islink(path) and os.path.isabs(os.readlink(path)):
-                _fix_symlink(path, debdir, root)
+                target = os.path.join(debdir, os.readlink(path)[1:])
+                if _skip_link(os.readlink(path)):
+                    logger.debug('Skipping {}'.format(target))
+                    continue
+                if not os.path.exists(target):
+                    if not _try_copy_local(path, target):
+                        continue
+                os.remove(path)
+                os.symlink(os.path.relpath(target, root), path)
             elif os.path.exists(path):
                 _fix_filemode(path)
-
-            if path.endswith('.pc') and not os.path.islink(path):
-                fix_pkg_config(debdir, path)
 
 
 def _fix_xml_tools(root):
@@ -343,17 +325,6 @@ def _fix_xml_tools(root):
                 format(root), xslt_config_path])
 
 
-def _fix_symlink(path, debdir, root):
-    target = os.path.join(debdir, os.readlink(path)[1:])
-    if _skip_link(os.readlink(path)):
-        logger.debug('Skipping {}'.format(target))
-        return
-    if not os.path.exists(target) and not _try_copy_local(path, target):
-        return
-    os.remove(path)
-    os.symlink(os.path.relpath(target, root), path)
-
-
 def _fix_filemode(path):
     mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
     if mode & 0o4000 or mode & 0o2000:
@@ -365,9 +336,12 @@ def _fix_shebangs(path):
     """Changes hard coded shebangs for files in _BIN_PATHS to use env."""
     paths = [p for p in _BIN_PATHS if os.path.exists(os.path.join(path, p))]
     for p in [os.path.join(path, p) for p in paths]:
-        common.replace_in_file(p, re.compile(r''),
+        try:
+            common.replace_in_file(p, re.compile(r''),
                                re.compile(r'#!.*python\n'),
                                r'#!/usr/bin/env python\n')
+        except PermissionError:
+            pass
 
 
 _skip_list = None
@@ -376,7 +350,7 @@ _skip_list = None
 def _skip_link(target):
     global _skip_list
     if not _skip_list:
-        output = common.run_output(['dpkg', '-L', 'libc6']).split()
+        output = common.run_output(['rpm', '-ql', 'glibc']).split()
         _skip_list = [i for i in output if 'lib' in i]
 
     return target in _skip_list
@@ -388,7 +362,11 @@ def _try_copy_local(path, target):
         logger.warning(
             'Copying needed target link from the system {}'.format(real_path))
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copyfile(os.readlink(path), target)
+        src = os.readlink(path)
+        if os.path.isdir(src):
+           logger.warning("Skip copying source '%s' because its a directory" % src)
+        else:
+           shutil.copyfile(src, target)
         return True
     else:
         logger.warning(
