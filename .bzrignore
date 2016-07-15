@@ -7,6 +7,10 @@ demos/suse/*/parts/
 demos/suse/*/prime/
 demos/suse/*/stage/
 demos/suse/**/*.snap
+demos/ubuntu/*/parts/
+demos/ubuntu/*/prime/
+demos/ubuntu/*/stage/
+demos/ubuntu/**/*.snap
 tests/unit/parts/
 tests/unit/snap/
 tests/unit/stage/
