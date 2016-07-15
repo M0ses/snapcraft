@@ -188,7 +188,7 @@ class Repo:
     def _manifest_dep_names(self):
         manifest_dep_names = set()
 
-        with open(os.path.abspath(os.path.join(__file__, '..',
+        with open(os.path.abspath(os.path.join(__file__, '..', '..',
                                                'manifest.txt'))) as f:
             for line in f:
                 pkg = line.strip()
