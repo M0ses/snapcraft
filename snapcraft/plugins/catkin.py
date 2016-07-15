@@ -211,7 +211,7 @@ deb http://${security}.ubuntu.com/${suffix} trusty-security main universe
             os.makedirs(ubuntudir, exist_ok=True)
 
             logger.info('Preparing to fetch package dependencies...')
-            ubuntu = repo.Ubuntu(
+            ubuntu = repo.Repo(
                 ubuntudir, self.project,
                 sources=self.PLUGIN_STAGE_SOURCES,
                 project_options=self.project)
@@ -400,7 +400,7 @@ def _find_system_dependencies(catkin_packages, rosdep):
                 raise RuntimeError(
                     "Package {!r} isn't a valid system dependency. "
                     "Did you forget to add it to catkin-packages? If "
-                    "not, add the Ubuntu package containing it to "
+                    "not, add the distribution's package containing it to "
                     "stage-packages until you can get it into the "
                     "rosdep database.".format(dependency))
 
@@ -448,7 +448,7 @@ class _Rosdep:
         # want to bloat the .snap more than necessary. So we'll unpack it
         # somewhere else, and use it from there.
         logger.info('Preparing to fetch rosdep...')
-        ubuntu = repo.Ubuntu(self._rosdep_path, sources=self._ubuntu_sources,
+        ubuntu = repo.Repo(self._rosdep_path, sources=self._ubuntu_sources,
                              project_options=self._project)
 
         logger.info('Fetching rosdep...')
